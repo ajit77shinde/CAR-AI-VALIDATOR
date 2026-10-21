@@ -1,15 +1,18 @@
 # Car AI Listing Validator
 
-Independent FastAPI service that validates used-car listing **text + images** and returns a recommended listing status for `car-api` to apply.
+Independent FastAPI service that:
 
-This service does **not** send email. Seller notifications (if any) belong in `car-api`.
+1. **Validates** used-car listing text + images and returns a recommended status for `car-api`
+2. **Parses** WhatsApp-style dealer inventory text into structured car JSON for the Preown admin import UI
+
+This service does **not** save cars or send email. Saving belongs in `car-api`; seller notifications belong in `car-api`.
 
 ## Stack
 
 - Python 3.11+
 - FastAPI + Uvicorn
 - Pydantic v2 / pydantic-settings
-- OpenAI Chat Completions (vision), with a local rules fallback when no API key is set
+- OpenAI Chat Completions (vision for moderation; text for inventory parse)
 
 ## Setup
 
@@ -19,7 +22,7 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env: set API_KEY; optionally OPENAI_API_KEY
+# edit .env: set API_KEY; set OPENAI_API_KEY for AI features
 ```
 
 ## Run
@@ -47,62 +50,80 @@ No auth. Returns `{ "status": "ok" }`.
 
 Requires header: `X-API-Key: <API_KEY>`
 
-**Request example:**
+Moderates a listing and returns `riskLevel`, recommended `status`, findings, etc.
+
+### `POST /parse-cars`
+
+No auth (v1 — for local admin / Postman). CORS limited to configured origins.
+
+Turns WhatsApp-style inventory text into structured cars for the admin import page.
+Does **not** save cars — frontend/admin calls `car-api` later.
+
+**Request:**
 
 ```json
 {
-  "carId": "66f...",
-  "make": "Honda",
-  "model": "City",
-  "variant": "VX",
-  "year": 2020,
-  "mileage": 40000,
-  "price": 750000,
-  "location": "Pune",
-  "description": "Well maintained single owner car.",
-  "ownerHistory": "1st owner",
-  "whenTOSell": "ASAP",
-  "fuel_type": "Petrol",
-  "transmission_type": "Manual",
-  "images": ["https://your-bucket.s3.amazonaws.com/cars/1.jpg"]
+  "message": "raw whatsapp text with one or more cars",
+  "dealerId": "optional string for context only — do not invent cars from it"
 }
 ```
 
-**Response example:**
+**Response 200:**
 
 ```json
 {
-  "riskLevel": "ok",
-  "status": "active",
-  "flaggedForAdmin": false,
-  "categories": [],
-  "score": 0,
-  "feedback": "Listing looks fine.",
-  "textFindings": [],
-  "imageFindings": [],
-  "model": "rules-fallback",
-  "reviewedAt": "2026-09-18T13:00:00Z"
+  "cars": [
+    {
+      "make": "Hyundai",
+      "model": "Creta",
+      "variant": "SX",
+      "location": "Pune",
+      "year": 2021,
+      "mileage": 32000,
+      "price": 1450000,
+      "fuel_type": "Petrol",
+      "transmission_type": "Automatic",
+      "description": "Single owner, company service",
+      "ownerHistory": "1st owner",
+      "whenTOSell": "Immediate"
+    }
+  ],
+  "warnings": ["optional human-readable notes about guesses / missing fields"]
 }
 ```
 
-### Status mapping
+- Invalid body → `400`
+- LLM / config failure → `502` (no secrets in the message)
 
-| riskLevel | status | flaggedForAdmin | Meaning |
-|-----------|--------|-----------------|---------|
-| ok | active | false | Keep live |
-| soft | active | true | Keep live + admin queue |
-| hard + nsfw | hidden | true | Auto-hide |
-| hard (scam/spam) | flagged | true | Auto-hide |
+#### Sample curl
+
+```bash
+curl -s -X POST http://localhost:8090/parse-cars \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dealerId": "autonity",
+    "message": "Hi, please add these cars for Autonity showroom:\n\n1) Hyundai Creta SX 2021\nPetrol Automatic\n32,000 km\nPrice 14.5 Lakh\nPune\nSingle owner, company service\n\n2) Maruti Swift VXI 2019\nPetrol Manual\n45k km\n₹6,80,000\nHinjewadi\nImmediate sale"
+  }'
+```
+
+Point the admin frontend at this service:
+
+```env
+VITE_AI_IMPORT_URL=http://localhost:8090
+```
 
 ## Env
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `API_KEY` | yes | Shared secret; car-api sends as `X-API-Key` |
-| `OPENAI_API_KEY` | no | If empty, rules fallback is used |
+| `API_KEY` | yes (for validate) | Shared secret; car-api sends as `X-API-Key` |
+| `OPENAI_API_KEY` | yes (for parse / AI validate) | OpenAI-compatible API key |
 | `OPENAI_MODEL` | no | Default `gpt-4o-mini` |
+| `OPENAI_BASE_URL` | no | Optional OpenAI-compatible base URL |
+| `CORS_ORIGINS` | no | Comma-separated origins (default `http://localhost:3000,http://localhost:5173`) |
+| `PORT` | no | Default `8090` |
 
-## Connecting from car-api (later)
+## Connecting from car-api (validate)
 
 1. Set in car-api env:
    - `AI_VALIDATOR_URL=http://localhost:8090`
@@ -111,7 +132,7 @@ Requires header: `X-API-Key: <API_KEY>`
 3. Apply returned `status`, `flaggedForAdmin`, and store the rest as `moderationResult`.
 4. Public browse should only show `status: active`.
 
-### curl smoke test
+### curl smoke test (validate)
 
 ```bash
 curl -s http://localhost:8090/health
@@ -125,6 +146,14 @@ curl -s -X POST http://localhost:8090/v1/validate-listing \
     "description":"Clean car","images":[]
   }'
 ```
+
+## How the three pieces fit (WhatsApp import)
+
+| Piece | Job |
+| --- | --- |
+| Frontend admin page | Paste message → call AI → show cards → Save |
+| **This AI service** (`POST /parse-cars`) | Text → structured `cars[]` JSON |
+| car-api | `POST /admin/dealers/:id/cars` saves as `hidden` |
 
 ## Project location
 
